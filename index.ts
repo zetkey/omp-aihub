@@ -99,6 +99,8 @@ interface LearnedPricing {
 	cacheRatio?: number;
 	/** Actual group ratio billed to this key (may differ from the public catalog). */
 	groupRatio: number;
+	/** Context the channel verifiably served (live probe) — outranks catalog/borrowed values. */
+	contextWindow?: number;
 	at: number;
 }
 
@@ -125,8 +127,21 @@ function loadLearned(): Map<string, LearnedPricing> {
 	return out;
 }
 
-/** Upsert learned ratios from consume-log rows; persist when anything changed. */
+/** Persist the learned store (created by learnFromLogs / learnFromProbe). */
+function saveLearned(learned: Map<string, LearnedPricing>): void {
+	try {
+		fs.writeFileSync(LEARNED_PATH, JSON.stringify({ version: 1, learned: Object.fromEntries(learned) }, null, 1));
+	} catch {
+		// Persistence is best-effort; in-session learning still applies.
+	}
+}
+
+/** Upsert learned ratios from consume-log rows; persists when anything changed. */
 function learnFromLogs(rows: LogRow[], learned: Map<string, LearnedPricing>): boolean {
+	// Merge into the persisted store, not just the passed map, so probe-verified
+	// contextWindows survive even when the caller's map predates the probe write.
+	const persisted = loadLearned();
+	for (const [id, entry] of persisted) if (!learned.has(id)) learned.set(id, entry);
 	let changed = false;
 	for (const r of rows) {
 		if (r.type !== 2 || !r.model_name) continue;
@@ -142,9 +157,12 @@ function learnFromLogs(rows: LogRow[], learned: Map<string, LearnedPricing>): bo
 		const mr = typeof other.model_ratio === "number" ? other.model_ratio : 0;
 		if (mode === "ratio" && !(mr > 0 && typeof other.completion_ratio === "number" && other.completion_ratio > 0))
 			continue;
+		const prev = learned.get(r.model_name);
 		const entry: LearnedPricing = {
 			mode,
 			groupRatio: group,
+			// Probe-verified context survives log refreshes (logs carry no context data).
+			...(prev?.contextWindow !== undefined ? { contextWindow: prev.contextWindow } : {}),
 			...(mode === "ratio"
 				? {
 						modelRatio: mr,
@@ -154,20 +172,10 @@ function learnFromLogs(rows: LogRow[], learned: Map<string, LearnedPricing>): bo
 				: {}),
 			at: Date.now(),
 		};
-		const prev = learned.get(r.model_name);
 		if (!prev || prev.groupRatio !== entry.groupRatio || prev.modelRatio !== entry.modelRatio) changed = true;
 		learned.set(r.model_name, entry);
 	}
-	if (changed) {
-		try {
-			fs.writeFileSync(
-				LEARNED_PATH,
-				JSON.stringify({ version: 1, learned: Object.fromEntries(learned) }, null, 1),
-			);
-		} catch {
-			// Persistence is best-effort; in-session learning still applies.
-		}
-	}
+	if (changed) saveLearned(learned);
 	return changed;
 }
 
@@ -180,6 +188,77 @@ function costFromLearned(l: LearnedPricing): CostCard {
 		cacheRead: base * (l.cacheRatio ?? 0) * l.groupRatio,
 		cacheWrite: 0,
 	};
+}
+
+/** Record a verified context window from a live probe; persists immediately. */
+function learnFromProbe(modelId: string, contextWindow: number): void {
+	const learned = loadLearned();
+	const prev = learned.get(modelId);
+	learned.set(modelId, {
+		mode: prev?.mode ?? "ratio",
+		...(prev?.modelRatio !== undefined ? { modelRatio: prev.modelRatio } : {}),
+		...(prev?.completionRatio !== undefined ? { completionRatio: prev.completionRatio } : {}),
+		...(prev?.cacheRatio !== undefined ? { cacheRatio: prev.cacheRatio } : {}),
+		...(prev?.groupRatio !== undefined ? { groupRatio: prev.groupRatio } : { groupRatio: DEFAULT_GROUP_RATIO }),
+		contextWindow,
+		at: Date.now(),
+	});
+	saveLearned(learned);
+}
+
+/** Probe one model's served context: send ~1 token-pair per claimed 16k of window.
+ * HTTP 4xx = channel rejects that size (definitive); timeout/network error = retry once,
+ * then skip the size as inconclusive. Returns the largest window verifiably served. */
+async function probeModelContext(
+	base: string,
+	apiKey: string,
+	modelId: string,
+	claimed: number,
+	log: (m: string) => void,
+): Promise<number | null> {
+	// Candidates: the claim itself, then common catalog sizes.
+	const ladder = [claimed, 1_000_000, 262_144, 131_072, 128_000, 65_536, 32_768]
+		.filter((v, i, a) => v > 0 && a.indexOf(v) === i)
+		.sort((a, b) => b - a);
+	for (const size of ladder) {
+		// ~2 tokens per "word"; pad to size-64 so the request fits exactly size if served.
+		const words = Math.max(64, Math.floor((size - 64) / 2));
+		const body = {
+			model: modelId,
+			max_tokens: 8,
+			messages: [{ role: "user", content: `Repeat the single word: ping. Context filler: ${"x ".repeat(words)}` }],
+		};
+		let accepted = false;
+		let definitiveReject = false;
+		// Attempt 1 + 1 retry for timeouts (large fills can exceed a first attempt).
+		for (let attempt = 0; attempt < 2 && !accepted && !definitiveReject; attempt++) {
+			try {
+				const res = await fetch(`${base}/v1/chat/completions`, {
+					method: "POST",
+					headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+					body: JSON.stringify(body),
+					signal: AbortSignal.timeout(120_000),
+				});
+				if (res.ok) {
+					accepted = true;
+					break;
+				}
+				// 4xx at this size: the channel definitively refuses it.
+				definitiveReject = res.status >= 400 && res.status < 500;
+				if (attempt === 0 && !definitiveReject) continue;
+				log(`${definitiveReject ? "reject" : "http-error"} @ ${size.toLocaleString()} (HTTP ${res.status})`);
+			} catch (e) {
+				if (attempt === 0) continue; // timeout/network → retry once
+				log(`timeout @ ${size.toLocaleString()} (inkonklusif, dilewati)`);
+			}
+		}
+		if (accepted) {
+			log(`ok @ ${size.toLocaleString()}`);
+			return size;
+		}
+		if (definitiveReject) continue;
+	}
+	return null;
 }
 
 /** Per-token USD/M rate card for one model. */
@@ -405,9 +484,11 @@ async function buildModelMetas(base: string, apiKey: string | undefined): Promis
 			? "openai-images"
 			: (EP_TYPE_TO_API[epTypes.find((t) => EP_TYPE_TO_API[t] !== undefined) ?? ""] ?? "openai-completions");
 
-		// Context/output gaps: bundled reference of the same id, else generic chat defaults.
+		// Context/output gaps: verified-by-probe value wins, then catalog field, then
+		// bundled reference of the same id, then generic chat defaults.
 		const ref = refs.get(m.id);
-		const contextWindow = row?.context_length ?? ref?.contextWindow ?? 128_000;
+		const learnedEntry = learned.get(m.id);
+		const contextWindow = learnedEntry?.contextWindow ?? row?.context_length ?? ref?.contextWindow ?? 128_000;
 		const maxTokens = Math.min(row?.max_output_tokens ?? ref?.maxTokens ?? 32_768, contextWindow);
 
 		const input: ("text" | "image")[] = [];
@@ -627,6 +708,77 @@ export default function aihubExtension(pi: object) {
 				}
 			} catch (e) {
 				notify(ctx, `aihub refresh gagal: ${(e as Error).message}`, "error");
+			}
+		},
+	});
+
+	host.registerCommand("aihub-probe", {
+		description: "Probe the actually-served context window (args: <model-id …> | all [--max N])",
+		handler: async (args: string, ctx: unknown) => {
+			const key = await resolveApiKey(ctx);
+			if (!key) {
+				notify(ctx, "aihub: /login aihub atau set AIHUB_API_KEY dulu", "warning");
+				return;
+			}
+			const reg = registryOf(ctx);
+			const argv = args.trim().split(/\s+/).filter(Boolean);
+			const all = argv[0] === "all";
+			const maxCount = all ? Math.max(1, Number(argv.find((a) => a.startsWith("--max="))?.split("=")[1] ?? 5)) : argv.length;
+			if (!all && argv.length === 0) {
+				notify(ctx, "pakai: /aihub-probe <model-id> … | all [--max=N]", "warning");
+				return;
+			}
+			try {
+				// Build the claimed-context map the same way the builder does.
+				const pricing = await fetchPricing(base);
+				const catalogCtx = new Map<string, number>();
+				for (const row of pricing.data ?? []) {
+					if (row.context_length) catalogCtx.set(row.model_name, row.context_length);
+				}
+				const refs = bundledReference();
+				/** Session model rows narrowed via guard (ctx.models may be absent in print mode). */
+				const sessionModels: { id: string; contextWindow: number }[] = [];
+				const modelsList = (ctx as { models?: unknown } | null)?.models;
+				if (modelsList && typeof modelsList === "object" && "list" in modelsList) {
+					const listed = (modelsList as { list: () => unknown }).list();
+					if (Array.isArray(listed)) {
+						for (const m of listed) {
+							if (m && typeof m === "object" && "id" in m && "contextWindow" in m && "provider" in m) {
+								const row = m as { provider: unknown; id: unknown; contextWindow: unknown };
+								if (row.provider === PROVIDER_ID && typeof row.id === "string" && typeof row.contextWindow === "number") {
+									sessionModels.push({ id: row.id, contextWindow: row.contextWindow });
+								}
+							}
+						}
+					}
+				}
+				const targetIds = all
+					? sessionModels.map((m) => ({ id: m.id, claimed: m.contextWindow }))
+					: argv.map((id) => {
+							const norm = id.toLowerCase().replaceAll(".", "-");
+							const claimed =
+								catalogCtx.get(id) ??
+								[...catalogCtx.entries()].find(([k]) => k.toLowerCase().replaceAll(".", "-") === norm)?.[1] ??
+								refs.get(id)?.contextWindow ??
+								128_000;
+							return { id, claimed };
+						});
+				const learned = loadLearned();
+				const results: string[] = [];
+				for (const { id, claimed } of targetIds.slice(0, all ? maxCount : undefined)) {
+					const line = (s: string) => notify(ctx, `/aihub-probe ${id}: ${s}`, "info");
+					const served = await probeModelContext(base, key, id, claimed, line);
+					if (served !== null) {
+						learnFromProbe(id, served);
+						results.push(`${id}: ${served.toLocaleString()} verified (claimed ${claimed.toLocaleString()})`);
+					} else {
+						results.push(`${id}: probe gagal (semua claim ditolak)`);
+					}
+				}
+				notify(ctx, `Hasil probe:\n${results.join("\n")}\n→ /aihub-refresh untuk menerapkan.`, "info");
+				void reg;
+			} catch (e) {
+				notify(ctx, `aihub probe gagal: ${(e as Error).message}`, "error");
 			}
 		},
 	});

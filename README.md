@@ -35,6 +35,18 @@ outrank catalog estimates; expr-mode models keep their `billing_expr` price scal
 learned group ratio. Flow for an unpriced model: use it once → run `/aihub-usage` (or wait
 for the next auto-refresh) → price appears.
 
+## Verified context (`/aihub-probe`)
+
+A model's served context is a property of the gateway channel, not the vendor catalog —
+the same model id can carry different windows elsewhere, and borrowed catalog references
+can overshoot what aihub actually accepts. `/aihub-probe <model-id> …` (or
+`/aihub-probe all --max=N`) sends input-heavy requests down a size ladder and records the
+largest window the channel verifiably serves into the same learned store; verified values
+outrank catalog fields and borrowed references. Billing notes: a probe bills its input
+tokens (one 256k-window probe ≈ 130k input tokens at that model's input rate), HTTP 4xx
+counts as a definitive rejection, timeouts are retried once and otherwise skipped as
+inconclusive (never recorded).
+
 ## Install
 
 ```sh
