@@ -289,12 +289,17 @@ async function buildModelMetas(base: string, apiKey: string | undefined): Promis
 	]);
 	const rows = new Map<string, NewApiPricingRow>();
 	for (const row of pricing.data ?? []) rows.set(row.model_name, row);
+	/** Roster/katalog kadang beda ejaan versi: deepseek-v4.1-flash vs deepseek-v4-1-flash. */
+	const norm = (id: string) => id.toLowerCase().replaceAll(".", "-");
+	const rowsByNorm = new Map<string, NewApiPricingRow>();
+	for (const row of pricing.data ?? []) rowsByNorm.set(norm(row.model_name), row);
+	const rowFor = (id: string): NewApiPricingRow | undefined => rows.get(id) ?? rowsByNorm.get(norm(id));
 	const groupRatio = groupRatioOf(pricing);
 	const refs = bundledReference();
 
 	const metas: ModelMeta[] = [];
 	for (const m of roster.data ?? []) {
-		const row = rows.get(m.id);
+		const row = rowFor(m.id);
 		const epTypes = m.supported_endpoint_types ?? row?.supported_endpoint_types ?? [];
 		const isImage = epTypes.some((t) => IMAGE_KIND_ENDPOINTS[t] === true);
 		const api = isImage
