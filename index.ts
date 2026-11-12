@@ -48,6 +48,8 @@ interface NewApiPricingRow {
 	completion_ratio?: number;
 	cache_ratio?: number;
 	create_cache_ratio?: number;
+	/** tiered_expr models: real price lives here; model_ratio is junk there. */
+	billing_expr?: string;
 	context_length?: number;
 	max_output_tokens?: number;
 	input_modalities?: string[];
@@ -102,7 +104,8 @@ interface ModelMeta {
 	isImage: boolean;
 	reasoning: boolean;
 	input: ("text" | "image")[];
-	cost: CostCard;
+	cost?: CostCard;
+	longContext?: { inputThreshold: number; input: number; output: number; cacheRead: number; cacheWrite: number };
 	contextWindow: number;
 	maxTokens: number;
 }
@@ -143,6 +146,58 @@ const IMAGE_KIND_ENDPOINTS: Record<string, true> = {
 	"image-generation": true,
 	"openai-image-edit": true,
 };
+
+/** One linear price branch inside a billing_expr, already in USD/M (p=input, c=output, cr=cache read). */
+interface ExprBranch {
+	input: number;
+	output: number;
+	cacheRead: number;
+}
+
+/**
+ * tiered_expr rows carry junk model_ratio (e.g. deepseek-v4-1-flash 37.5); their real
+ * price lives in billing_expr as `p * A + c * B + cr * C` branches (optionally scaled by
+ * a time multiplier). Coefficients are USD/M — verified against the gateway pricing page.
+ */
+const EXPR_BRANCH_RE = /p\s*\*\s*([\d.]+)\s*\+\s*c\s*\*\s*([\d.]+)\s*\+\s*cr\s*\*\s*([\d.]+)/g;
+/** Multiplier alternatives from `cond ? 0.5 : 1` time-discount forms. */
+const EXPR_FACTOR_RE = /\?\s*([\d.]+)\s*:\s*([\d.]+)/g;
+
+/** Peak-safe cost from a billing_expr (null when unparseable). Length-split exprs
+ * (`len <= N ? tier(A) : tier(B)`) map to omp's cost.longContext: base = tier A,
+ * longContext = tier B at threshold N. Time-discount exprs keep the priciest branch. */
+function costFromBillingExpr(
+	expr: string,
+	groupRatio: number,
+): { cost: CostCard; longContext?: { inputThreshold: number; input: number; output: number; cacheRead: number; cacheWrite: number } } | null {
+	const branches: ExprBranch[] = [];
+	for (const m of expr.matchAll(EXPR_BRANCH_RE)) {
+		branches.push({ input: Number(m[1]), output: Number(m[2]), cacheRead: Number(m[3]) });
+	}
+	if (branches.length === 0) return null;
+	const scale = (b: ExprBranch, f: number) => ({
+		input: b.input * f * groupRatio,
+		output: b.output * f * groupRatio,
+		cacheRead: b.cacheRead * f * groupRatio,
+	});
+
+	// `len <= N ? tierA : tierB` → two real context tiers.
+	const lenGuard = expr.match(/len\s*<=\s*(\d+)\s*\?/);
+	if (lenGuard && branches.length >= 2) {
+		const threshold = Number(lenGuard[1]);
+		return {
+			cost: { ...scale(branches[0], 1), cacheWrite: 0 },
+			longContext: { inputThreshold: threshold, ...scale(branches[1], 1), cacheWrite: 0 },
+		};
+	}
+
+	let maxFactor = 1;
+	for (const m of expr.matchAll(EXPR_FACTOR_RE)) {
+		maxFactor = Math.max(maxFactor, Number(m[1]), Number(m[2]));
+	}
+	const priciest = branches.reduce((a, b) => (b.input > a.input ? b : a));
+	return { cost: { ...scale(priciest, maxFactor), cacheWrite: 0 } };
+}
 
 function costForRow(row: NewApiPricingRow | undefined, groupRatio: number): CostCard | null {
 	if (!row || row.quota_type === 1) return null; // per-call image models: no token rate card
@@ -267,7 +322,17 @@ async function buildModelMetas(base: string, apiKey: string | undefined): Promis
 			isImage,
 			reasoning: row?.capabilities?.includes("reasoning") ?? ref?.reasoning ?? true,
 			input,
-			cost: costForRow(row, groupRatio) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			// tiered_expr: billing_expr is authoritative (model_ratio there is junk);
+			// plain ratio rows compute from ratios; no row → omit cost so the host
+			// falls back to the bundled catalog reference instead of showing free.
+			...((): { cost?: CostCard; longContext?: ModelMeta["longContext"] } => {
+				if (!row) return {};
+				if (row.billing_expr) {
+					const parsed = costFromBillingExpr(row.billing_expr, groupRatio);
+					return parsed ? { cost: parsed.cost, longContext: parsed.longContext } : {};
+				}
+				return { cost: costForRow(row, groupRatio) ?? undefined };
+			})(),
 			contextWindow,
 			maxTokens,
 		});
@@ -278,7 +343,9 @@ async function buildModelMetas(base: string, apiKey: string | undefined): Promis
 /** metas → host model rows. pi: type:"image"+output; omp: kind:"image". */
 function metasToProviderModels(isPi: boolean, metas: ModelMeta[]): Record<string, unknown>[] {
 	return metas.map((m) => {
-		const base: Record<string, unknown> = { id: m.id, name: m.id, input: m.input, cost: m.cost }; // m.id === model id
+		const base: Record<string, unknown> = { id: m.id, name: m.id, input: m.input };
+		if (m.cost) base.cost = m.cost; // omitted → host applies its bundled-reference fallback
+		if (m.longContext) base.cost = { ...(base.cost as CostCard | undefined), longContext: m.longContext };
 		if (m.isImage) {
 			return isPi ? { ...base, type: "image", api: "openai-images", output: ["image"] } : { ...base, kind: "image", api: "openai-images" };
 		}

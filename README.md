@@ -16,6 +16,10 @@ the gap from the gateway's own public catalog:
 Pricing math (verified against the gateway's own billing records and official vendor cards):
 `USD/M = model_ratio × $2`, output `× completion_ratio`, cache read `× cache_ratio`, cache
 write `× create_cache_ratio`, all `× group_ratio` (cheapest enabled group, 0.9 on aihub).
+Models with `billing_mode: tiered_expr` are priced from their `billing_expr` (their
+`model_ratio` field is junk): length-split exprs (`len <= N ? tierA : tierB`) map to omp's
+`cost.longContext` (e.g. qwen3.7-plus ≤256k vs >256k), time-discount exprs keep the peak
+branch × group ratio (e.g. deepseek off-peak ×0.5).
 
 Models missing `context_length` fall back to the bundled catalog reference of the same id
 (other provider's row), then generic defaults.
