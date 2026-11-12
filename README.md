@@ -24,6 +24,17 @@ branch × group ratio (e.g. deepseek off-peak ×0.5).
 Models missing `context_length` fall back to the bundled catalog reference of the same id
 (other provider's row), then generic defaults.
 
+## Learned pricing
+
+The gateway publishes rate cards for only ~111 of 162 roster ids. For the rest (and to
+correct group-ratio drift), the plugin learns the **actual** billed ratios from your own
+consume logs (`/api/log/token` → `other.model_ratio/completion_ratio/cache_ratio/group_ratio`)
+whenever it refreshes or you run `/aihub-usage`, and persists them to
+`~/.omp/agent/aihub-pricing-learned.json` (override: `AIHUB_LEARNED_PATH`). Learned ratios
+outrank catalog estimates; expr-mode models keep their `billing_expr` price scaled by the
+learned group ratio. Flow for an unpriced model: use it once → run `/aihub-usage` (or wait
+for the next auto-refresh) → price appears.
+
 ## Install
 
 ```sh
@@ -47,12 +58,11 @@ Either works:
 
 Model/pricing/context refresh automatically through omp's model cache (24 h TTL).
 Force an immediate refresh with `/aihub-refresh`. `/aihub-usage` prints account credit,
-key quota, and the last-window per-model spend breakdown (port of the `aihub-usage` CLI).
+key quota, and the last-window per-model spend breakdown.
 
 ## Notes
 
-- Registers under provider id `aihub` so it never collides with an existing `metra` entry
-  in `models.yml` (an authoritative discovery cache there would zero out the plugin's prices).
+- Registers under provider id `aihub`.
 - Models route by the gateway's `supported_endpoint_types`: `anthropic` → `/v1/messages`,
   `openai-response` → `/v1/responses`, `gemini` → GenerateContent, else Chat Completions.
   Image-generation models land in the `image` kind for `generate_image`.

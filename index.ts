@@ -87,6 +87,99 @@ interface LogRow {
 	prompt_tokens?: number;
 	completion_tokens?: number;
 	quota?: number;
+	/** JSON blob with the actual billing ratios (model_ratio, group_ratio, …). */
+	other?: string;
+}
+
+/** Ratios actually charged to this key, learned from /api/log/token rows. */
+interface LearnedPricing {
+	mode: "ratio" | "expr";
+	modelRatio?: number;
+	completionRatio?: number;
+	cacheRatio?: number;
+	/** Actual group ratio billed to this key (may differ from the public catalog). */
+	groupRatio: number;
+	at: number;
+}
+
+const LEARNED_PATH =
+	process.env.AIHUB_LEARNED_PATH ?? `${process.env.HOME ?? "~"}/.omp/agent/aihub-pricing-learned.json`;
+/** Node fs via runtime require; the bare `require` declaration types as unknown. */
+const fs = require("fs") as {
+	readFileSync: (path: string, encoding: string) => string;
+	writeFileSync: (path: string, data: string) => void;
+};
+
+function loadLearned(): Map<string, LearnedPricing> {
+	const out = new Map<string, LearnedPricing>();
+	try {
+		const parsed = JSON.parse(fs.readFileSync(LEARNED_PATH, "utf8")) as {
+			learned?: Record<string, LearnedPricing>;
+		};
+		for (const [id, entry] of Object.entries(parsed.learned ?? {})) {
+			if (entry && typeof entry.groupRatio === "number") out.set(id, entry);
+		}
+	} catch {
+		// No store yet / unreadable → estimates only.
+	}
+	return out;
+}
+
+/** Upsert learned ratios from consume-log rows; persist when anything changed. */
+function learnFromLogs(rows: LogRow[], learned: Map<string, LearnedPricing>): boolean {
+	let changed = false;
+	for (const r of rows) {
+		if (r.type !== 2 || !r.model_name) continue;
+		let other: Record<string, unknown>;
+		try {
+			other = JSON.parse(r.other ?? "{}") as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+		const group = other.group_ratio;
+		if (typeof group !== "number" || group <= 0) continue;
+		const mode: "ratio" | "expr" = other.billing_mode === "tiered_expr" ? "expr" : "ratio";
+		const mr = typeof other.model_ratio === "number" ? other.model_ratio : 0;
+		if (mode === "ratio" && !(mr > 0 && typeof other.completion_ratio === "number" && other.completion_ratio > 0))
+			continue;
+		const entry: LearnedPricing = {
+			mode,
+			groupRatio: group,
+			...(mode === "ratio"
+				? {
+						modelRatio: mr,
+						completionRatio: other.completion_ratio as number,
+						cacheRatio: typeof other.cache_ratio === "number" ? other.cache_ratio : 0,
+					}
+				: {}),
+			at: Date.now(),
+		};
+		const prev = learned.get(r.model_name);
+		if (!prev || prev.groupRatio !== entry.groupRatio || prev.modelRatio !== entry.modelRatio) changed = true;
+		learned.set(r.model_name, entry);
+	}
+	if (changed) {
+		try {
+			fs.writeFileSync(
+				LEARNED_PATH,
+				JSON.stringify({ version: 1, learned: Object.fromEntries(learned) }, null, 1),
+			);
+		} catch {
+			// Persistence is best-effort; in-session learning still applies.
+		}
+	}
+	return changed;
+}
+
+/** Cost from ratios actually billed to this key (authoritative over catalog estimates). */
+function costFromLearned(l: LearnedPricing): CostCard {
+	const base = (l.modelRatio ?? 0) * RATIO_USD_PER_M;
+	return {
+		input: base * l.groupRatio,
+		output: base * (l.completionRatio ?? 1) * l.groupRatio,
+		cacheRead: base * (l.cacheRatio ?? 0) * l.groupRatio,
+		cacheWrite: 0,
+	};
 }
 
 /** Per-token USD/M rate card for one model. */
@@ -283,10 +376,16 @@ async function fetchPricing(base: string): Promise<NewApiPricing> {
 }
 
 async function buildModelMetas(base: string, apiKey: string | undefined): Promise<ModelMeta[]> {
-	const [roster, pricing] = await Promise.all([
+	const [roster, pricing, logs] = await Promise.all([
 		fetchJson<{ data?: V1Model[] }>(`${base}/v1/models`, apiKey),
 		fetchPricing(base),
+		// Learning pass: consume logs carry the ratios actually billed to this key.
+		apiKey
+			? fetchJson<{ data?: LogRow[] }>(`${base}/api/log/token`, apiKey).catch(() => ({}) as { data?: LogRow[] })
+			: Promise.resolve({} as { data?: LogRow[] }),
 	]);
+	const learned = loadLearned();
+	if (logs.data?.length) learnFromLogs(logs.data, learned);
 	const rows = new Map<string, NewApiPricingRow>();
 	for (const row of pricing.data ?? []) rows.set(row.model_name, row);
 	/** Roster/katalog kadang beda ejaan versi: deepseek-v4.1-flash vs deepseek-v4-1-flash. */
@@ -327,16 +426,18 @@ async function buildModelMetas(base: string, apiKey: string | undefined): Promis
 			isImage,
 			reasoning: row?.capabilities?.includes("reasoning") ?? ref?.reasoning ?? true,
 			input,
-			// tiered_expr: billing_expr is authoritative (model_ratio there is junk);
-			// plain ratio rows compute from ratios; no row → omit cost so the host
-			// falls back to the bundled catalog reference instead of showing free.
+			// Cost precedence: (1) ratios actually billed to this key (learned from logs),
+			// (2) tiered_expr billing_expr, (3) catalog ratios × group ratio, (4) omit →
+			// host falls back to the bundled catalog reference instead of showing free.
 			...((): { cost?: CostCard; longContext?: ModelMeta["longContext"] } => {
+				const learnedEntry = learned.get(m.id);
+				if (learnedEntry && learnedEntry.mode === "ratio") return { cost: costFromLearned(learnedEntry) };
 				if (!row) return {};
 				if (row.billing_expr) {
-					const parsed = costFromBillingExpr(row.billing_expr, groupRatio);
+					const parsed = costFromBillingExpr(row.billing_expr, learnedEntry?.groupRatio ?? groupRatio);
 					return parsed ? { cost: parsed.cost, longContext: parsed.longContext } : {};
 				}
-				return { cost: costForRow(row, groupRatio) ?? undefined };
+				return { cost: costForRow(row, learnedEntry?.groupRatio ?? groupRatio) ?? undefined };
 			})(),
 			contextWindow,
 			maxTokens,
@@ -549,6 +650,7 @@ export default function aihubExtension(pi: object) {
 				const usedAcc = (use.total_usage ?? 0) / 100;
 				const t = tok.data ?? {};
 				const rows = (logs.data ?? []).filter((r) => r.type === 2);
+				const learnedNow = learnFromLogs((logs.data ?? []).filter((r) => r.type === 2), loadLearned());
 				/** model → jendela-log aggregate (dynamic keys). */
 				const byModel = new Map<string, { req: number; inTok: number; outTok: number; quota: number }>();
 				for (const r of rows) {
@@ -574,6 +676,7 @@ export default function aihubExtension(pi: object) {
 							([name, b]) =>
 								`  ${name}: ${b.req} req, ${b.inTok.toLocaleString()} in / ${b.outTok.toLocaleString()} out, $${(b.quota / QUOTA_PER_UNIT).toFixed(4)}`,
 						),
+					`Harga terpelajari dari log: ${loadLearned().size} model${learnedNow ? " (baru disimpan)" : ""} — pakai model tanpa harga sekali, lalu /aihub-refresh.`,
 				];
 				notify(ctx, lines.join("\n"), "info");
 			} catch (e) {
