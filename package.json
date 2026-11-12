@@ -1,0 +1,15 @@
+{
+	"name": "omp-aihub",
+	"version": "0.1.0",
+	"description": "metranet AI hub (aihub.metranet.co.id, new-api) provider for omp and pi: real pricing, context windows, usage reporting, and auto-refresh",
+	"type": "module",
+	"main": "index.ts",
+	"omp": {
+		"extensions": ["./index.ts"]
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"keywords": ["omp", "pi", "omp-plugin", "aihub", "metranet", "new-api"],
+	"license": "MIT"
+}

@@ -1,0 +1,59 @@
+# omp-aihub
+
+Provider plugin for [omp](https://github.com/can1357/oh-my-pi) (and upstream pi) for the
+metranet AI hub gateway (`aihub.metranet.co.id`, a [new-api](https://github.com/QuantumNous/new-api) instance).
+
+omp's generic OpenAI-model-list discovery reads `/v1/models`, which carries no pricing or
+context metadata — every model shows as free with guessed context windows. This plugin fills
+the gap from the gateway's own public catalog:
+
+| Data | Source |
+|------|--------|
+| Model roster + per-model API wire | `GET /v1/models` (auth) |
+| Prices (input/output/cache read/write), context window, max output, modalities, capabilities | `GET /api/pricing` (public) |
+| Account credit, key quota, per-model spend window | `/v1/dashboard/billing/*`, `/api/usage/token/`, `/api/log/token` |
+
+Pricing math (verified against the gateway's own billing records and official vendor cards):
+`USD/M = model_ratio × $2`, output `× completion_ratio`, cache read `× cache_ratio`, cache
+write `× create_cache_ratio`, all `× group_ratio` (cheapest enabled group, 0.9 on aihub).
+
+Models missing `context_length` fall back to the bundled catalog reference of the same id
+(other provider's row), then generic defaults.
+
+## Install
+
+```sh
+# from a git URL
+omp plugin install github:YOU/omp-aihub
+
+# or link a local checkout
+omp plugin link /path/to/omp-aihub
+```
+
+## Provide the API key
+
+Either works:
+
+- `/login` → pick **metranet AI hub (aihub)** and paste your `sk-…` key (stored credential wins), or
+- `export AIHUB_API_KEY=sk-…` (env fallback)
+
+`AIHUB_BASE_URL` overrides the gateway URL (other new-api deployments work unchanged).
+
+## Auto-update
+
+Model/pricing/context refresh automatically through omp's model cache (24 h TTL).
+Force an immediate refresh with `/aihub-refresh`. `/aihub-usage` prints account credit,
+key quota, and the last-window per-model spend breakdown (port of the `aihub-usage` CLI).
+
+## Notes
+
+- Registers under provider id `aihub` so it never collides with an existing `metra` entry
+  in `models.yml` (an authoritative discovery cache there would zero out the plugin's prices).
+- Models route by the gateway's `supported_endpoint_types`: `anthropic` → `/v1/messages`,
+  `openai-response` → `/v1/responses`, `gemini` → GenerateContent, else Chat Completions.
+  Image-generation models land in the `image` kind for `generate_image`.
+- Estimated prices use the public catalog group ratio; exact per-request billing can differ
+  if your key's group differs — the `/aihub-usage` command always shows gateway-exact quota.
+- pi support: same file loads via `pi.extensions`; dynamic refresh uses pi's
+  `refreshModels` and login returns `OAuthCredentials`. pi does not render the omp
+  `usage` surface, so account credit shows via `/aihub-usage` there.

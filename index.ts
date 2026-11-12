@@ -1,0 +1,512 @@
+/**
+ * omp-aihub — metranet AI hub (aihub.metranet.co.id, new-api) provider for omp AND pi.
+ *
+ * One source, two hosts: no host imports; the plugin detects its host at runtime
+ * and calls the matching registration surface.
+ *
+ *   omp: fetchDynamicModels + usage (UsageProvider) + oauth returning string|object
+ *   pi:  refreshModels + oauth returning OAuthCredentials; usage not rendered
+ *
+ * Data sources:
+ *   /v1/models   roster + supported_endpoint_types (auth: API key)
+ *   /api/pricing public: model_ratio/completion_ratio/cache_ratio/
+ *                create_cache_ratio, context_length, max_output_tokens,
+ *                modalities, capabilities, group_ratio
+ *   /v1/dashboard/billing/*, /api/usage/token/, /api/log/token → usage
+ *
+ * Pricing: ratio × $2/M (verified vs official model prices) × group_ratio.
+ * Models without context_length fall back to the bundled catalog reference of
+ * the same id, then generic defaults (user-requested reference fill).
+ *
+ * Auto-update: omp refreshes fetchDynamicModels through its model cache
+ * (default 24 h TTL); pi calls refreshModels on catalog refresh. /aihub-refresh
+ * forces an immediate refresh.
+ */
+
+// Runtime globals (Bun/omp host) — keeps the plugin dependency-free.
+declare const require: (id: string) => unknown;
+declare const process: { env: Record<string, string | undefined> };
+
+const PROVIDER_ID = "aihub";
+const DEFAULT_BASE = "https://aihub.metranet.co.id";
+/** Visible label (pi provider name). */
+const PROVIDER_NAME = "metranet AI hub (aihub)";
+/** new-api quota → USD: quota_per_unit quota = $1 (live-verified: 500000). */
+const QUOTA_PER_UNIT = 500_000;
+/** Ratio → USD/M base: model_ratio 1 = $2/M input (verified vs official cards). */
+const RATIO_USD_PER_M = 2;
+const FETCH_TIMEOUT_MS = 15_000;
+/** Gateway-wide group ratio when /api/pricing omits group_ratio. */
+const DEFAULT_GROUP_RATIO = 0.9;
+
+// ---------------------------------------------------------------- gateway types
+
+interface NewApiPricingRow {
+	model_name: string;
+	quota_type: number; // 0 = per-token, 1 = per-call
+	model_ratio?: number;
+	completion_ratio?: number;
+	cache_ratio?: number;
+	create_cache_ratio?: number;
+	context_length?: number;
+	max_output_tokens?: number;
+	input_modalities?: string[];
+	capabilities?: string[];
+	supported_endpoint_types?: string[];
+}
+
+interface NewApiPricing {
+	success?: boolean;
+	message?: string;
+	data?: NewApiPricingRow[];
+	group_ratio?: Record<string, number>;
+}
+
+interface V1Model {
+	id: string;
+	supported_endpoint_types?: string[];
+}
+
+interface TokenUsage {
+	total_granted?: number;
+	total_used?: number;
+	total_available?: number;
+	unlimited_quota?: boolean;
+	name?: string;
+}
+
+interface BillingSub {
+	hard_limit_usd?: number;
+}
+
+interface LogRow {
+	type?: number;
+	model_name?: string;
+	prompt_tokens?: number;
+	completion_tokens?: number;
+	quota?: number;
+}
+
+/** Per-token USD/M rate card for one model. */
+interface CostCard {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
+/** Host-agnostic model row the gateway data resolves to. */
+interface ModelMeta {
+	id: string;
+	api: string;
+	isImage: boolean;
+	reasoning: boolean;
+	input: ("text" | "image")[];
+	cost: CostCard;
+	contextWindow: number;
+	maxTokens: number;
+}
+
+/** Bundled-catalog reference (another provider's row for the same id). */
+interface BundledModelRef {
+	contextWindow: number;
+	maxTokens: number;
+	input: ("text" | "image")[];
+	reasoning: boolean;
+}
+
+// ---------------------------------------------------------------- helpers
+
+async function fetchJson<T>(url: string, apiKey?: string): Promise<T> {
+	const res = await fetch(url, {
+		headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+		signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+	});
+	if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
+	return (await res.json()) as T;
+}
+
+/** new-api /api/* handlers answer failures with HTTP 200 + {success:false} (aihub-usage trap). */
+function assertApiOk(body: NewApiPricing, what: string): void {
+	if (body.success === false) throw new Error(`${what} ditolak gateway: ${body.message ?? "unknown"}`);
+}
+
+/** new-api endpoint type → runner api (mirrors omp's own proxy-discovery rule). */
+const EP_TYPE_TO_API: Record<string, string> = {
+	anthropic: "anthropic-messages",
+	"openai-response": "openai-responses",
+	openai: "openai-completions",
+	gemini: "google-generative-ai",
+};
+
+const IMAGE_KIND_ENDPOINTS: Record<string, true> = {
+	"image-generation": true,
+	"openai-image-edit": true,
+};
+
+function costForRow(row: NewApiPricingRow | undefined, groupRatio: number): CostCard | null {
+	if (!row || row.quota_type === 1) return null; // per-call image models: no token rate card
+	const base = (row.model_ratio ?? 0) * RATIO_USD_PER_M;
+	return {
+		input: base * groupRatio,
+		output: base * (row.completion_ratio ?? 1) * groupRatio,
+		cacheRead: base * (row.cache_ratio ?? 0) * groupRatio,
+		cacheWrite: base * (row.create_cache_ratio ?? 0) * groupRatio,
+	};
+}
+
+/** Cheapest group ratio the gateway applies on top of model ratios. */
+function groupRatioOf(pricing: NewApiPricing): number {
+	const ratios = Object.values(pricing.group_ratio ?? {});
+	return ratios.length ? Math.min(...ratios) : DEFAULT_GROUP_RATIO;
+}
+
+/** Read a string prop off an unknown object without casting. */
+function readString(value: unknown, prop: string): string | undefined {
+	if (value && typeof value === "object" && prop in value) {
+		const candidate = (value as Record<string, unknown>)[prop];
+		if (typeof candidate === "string" && candidate) return candidate;
+	}
+	return undefined;
+}
+
+/** Bundled-catalog references for context/output gap-filling. */
+function bundledReference(): Map<string, BundledModelRef> {
+	const out = new Map<string, BundledModelRef>();
+	try {
+		// Legacy specifier: omp's loader rewrites it onto the host-bundled catalog.
+		// eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional compat surface
+		const mod = require("@mariozechner/pi-ai") as { getModels?: () => unknown[] };
+		const models = typeof mod.getModels === "function" ? mod.getModels() : [];
+		for (const m of models) {
+			const ctx = readNumber(m, "contextWindow");
+			const max = readNumber(m, "maxTokens");
+			if (!m || typeof m !== "object" || ctx === undefined) continue;
+			const input = readStringArray(m, "input");
+			out.set(readString(m, "id") ?? "", {
+				contextWindow: ctx,
+				maxTokens: max ?? 32_768,
+				input: input.filter((s): s is "text" | "image" => s === "text" || s === "image"),
+				reasoning: readBool(m, "reasoning"),
+			});
+		}
+	} catch {
+		// Reference unavailable → context gaps keep generic defaults instead of failing load.
+	}
+	return out;
+}
+
+function readNumber(value: unknown, prop: string): number | undefined {
+	if (value && typeof value === "object" && prop in value) {
+		const candidate = (value as Record<string, unknown>)[prop];
+		if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
+	}
+	return undefined;
+}
+
+function readBool(value: unknown, prop: string): boolean {
+	if (value && typeof value === "object" && prop in value) {
+		return (value as Record<string, unknown>)[prop] === true;
+	}
+	return false;
+}
+
+function readStringArray(value: unknown, prop: string): string[] {
+	if (value && typeof value === "object" && prop in value) {
+		const candidate = (value as Record<string, unknown>)[prop];
+		if (Array.isArray(candidate)) return candidate.filter((s): s is string => typeof s === "string");
+	}
+	return [];
+}
+
+// ---------------------------------------------------------------- model builder
+
+async function fetchPricing(base: string): Promise<NewApiPricing> {
+	const pricing = await fetchJson<NewApiPricing>(`${base}/api/pricing`);
+	assertApiOk(pricing, "/api/pricing");
+	return pricing;
+}
+
+async function buildModelMetas(base: string, apiKey: string | undefined): Promise<ModelMeta[]> {
+	const [roster, pricing] = await Promise.all([
+		fetchJson<{ data?: V1Model[] }>(`${base}/v1/models`, apiKey),
+		fetchPricing(base),
+	]);
+	const rows = new Map<string, NewApiPricingRow>();
+	for (const row of pricing.data ?? []) rows.set(row.model_name, row);
+	const groupRatio = groupRatioOf(pricing);
+	const refs = bundledReference();
+
+	const metas: ModelMeta[] = [];
+	for (const m of roster.data ?? []) {
+		const row = rows.get(m.id);
+		const epTypes = m.supported_endpoint_types ?? row?.supported_endpoint_types ?? [];
+		const isImage = epTypes.some((t) => IMAGE_KIND_ENDPOINTS[t] === true);
+		const api = isImage
+			? "openai-images"
+			: (EP_TYPE_TO_API[epTypes.find((t) => EP_TYPE_TO_API[t] !== undefined) ?? ""] ?? "openai-completions");
+
+		// Context/output gaps: bundled reference of the same id, else generic chat defaults.
+		const ref = refs.get(m.id);
+		const contextWindow = row?.context_length ?? ref?.contextWindow ?? 128_000;
+		const maxTokens = Math.min(row?.max_output_tokens ?? ref?.maxTokens ?? 32_768, contextWindow);
+
+		const input: ("text" | "image")[] = [];
+		const modalities = row?.input_modalities;
+		if (modalities) {
+			if (modalities.includes("text")) input.push("text");
+			if (modalities.includes("image")) input.push("image");
+		} else {
+			input.push("text");
+			if (ref?.input.includes("image") || row?.capabilities?.includes("vision")) input.push("image");
+		}
+
+		metas.push({
+			id: m.id,
+			api,
+			isImage,
+			reasoning: row?.capabilities?.includes("reasoning") ?? ref?.reasoning ?? true,
+			input,
+			cost: costForRow(row, groupRatio) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow,
+			maxTokens,
+		});
+	}
+	return metas;
+}
+
+/** metas → host model rows. pi: type:"image"+output; omp: kind:"image". */
+function metasToProviderModels(isPi: boolean, metas: ModelMeta[]): Record<string, unknown>[] {
+	return metas.map((m) => {
+		const base: Record<string, unknown> = { id: m.id, name: m.id, input: m.input, cost: m.cost }; // m.id === model id
+		if (m.isImage) {
+			return isPi ? { ...base, type: "image", api: "openai-images", output: ["image"] } : { ...base, kind: "image", api: "openai-images" };
+		}
+		return { ...base, api: m.api, reasoning: m.reasoning, contextWindow: m.contextWindow, maxTokens: m.maxTokens };
+	});
+}
+
+// ---------------------------------------------------------------- usage (omp)
+
+interface UsageCredentialShape {
+	apiKey?: string;
+}
+
+function makeUsageProvider(base: string) {
+	return {
+		id: PROVIDER_ID,
+		cacheVersion: 1,
+		validatesCredentials: true,
+		usesRequestKey: true,
+		async fetchUsage(params: { credential?: UsageCredentialShape }): Promise<Record<string, unknown> | null> {
+			const key = params?.credential?.apiKey;
+			if (!key) return null;
+			const get = async <T>(path: string): Promise<T | null> => {
+				try {
+					return await fetchJson<T>(`${base}${path}`, key);
+				} catch {
+					return null;
+				}
+			};
+			const [sub, use, tok] = await Promise.all([
+				get<BillingSub>("/v1/dashboard/billing/subscription"),
+				get<{ total_usage?: number }>("/v1/dashboard/billing/usage"),
+				get<{ data?: TokenUsage }>("/api/usage/token/"),
+			]);
+			if (!sub && !tok) return null;
+			const limits: Record<string, unknown>[] = [];
+			const total = sub?.hard_limit_usd;
+			const used = (use?.total_usage ?? 0) / 100; // endpoint reports cents
+			if (total !== undefined) {
+				const remaining = total - used;
+				limits.push({
+					id: "account-credit",
+					label: "Account credit",
+					scope: { provider: PROVIDER_ID },
+					amount: { used, limit: total, remaining, unit: "usd" },
+					status: total > 0 && remaining / total <= 0.1 ? "warning" : "ok",
+				});
+			}
+			const t = tok?.data;
+			if (t) {
+				const amount: Record<string, unknown> = { used: (t.total_used ?? 0) / QUOTA_PER_UNIT, unit: "usd" };
+				if (!t.unlimited_quota) {
+					amount.limit = (t.total_granted ?? 0) / QUOTA_PER_UNIT;
+					amount.remaining = (t.total_available ?? 0) / QUOTA_PER_UNIT;
+				}
+				limits.push({
+					id: "key-quota",
+					label: `Key quota${t.name ? ` (${t.name})` : ""}`,
+					scope: { provider: PROVIDER_ID },
+					amount,
+					status: "ok",
+				});
+			}
+			return { provider: PROVIDER_ID, fetchedAt: Date.now(), limits };
+		},
+	};
+}
+
+// ---------------------------------------------------------------- host commands
+
+/** ui.notify where available (command ctx carries it on both hosts). */
+function notify(ctx: unknown, message: string, level: "info" | "warning" | "error"): void {
+	const ui = (ctx as { ui?: { notify?: (m: string, t?: string) => void } } | null)?.ui;
+	ui?.notify?.(message, level);
+}
+
+interface RegistryWithRefresh {
+	refresh?: (strategy?: unknown, options?: unknown) => Promise<unknown>;
+	refreshAll?: () => Promise<unknown>;
+	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+}
+
+function registryOf(ctx: unknown): RegistryWithRefresh | undefined {
+	const reg = (ctx as { modelRegistry?: RegistryWithRefresh } | null)?.modelRegistry;
+	return reg && typeof reg === "object" ? reg : undefined;
+}
+
+async function resolveApiKey(ctx: unknown): Promise<string | undefined> {
+	const reg = registryOf(ctx);
+	try {
+		if (typeof reg?.getApiKey === "function") {
+			const k = await reg.getApiKey(PROVIDER_ID);
+			if (typeof k === "string" && k) return k;
+		}
+	} catch {
+		// fall through to env
+	}
+	const env = process.env.AIHUB_API_KEY;
+	return env || undefined;
+}
+
+// ---------------------------------------------------------------- extension
+
+export default function aihubExtension(pi: object) {
+	const base = (process.env.AIHUB_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
+	// pi exposes registerVirtualModel; omp does not. Kept as a structural check.
+	const isPi = "registerVirtualModel" in pi;
+	const host = pi as {
+		registerProvider: (name: string, config: Record<string, unknown>) => void;
+		registerCommand: (name: string, def: { description?: string; handler: (args: string, ctx: unknown) => Promise<void> }) => void;
+	};
+
+	async function fetchModels(apiKey: string | undefined): Promise<Record<string, unknown>[]> {
+		try {
+			const metas = await buildModelMetas(base, apiKey);
+			return metasToProviderModels(isPi, metas);
+		} catch (e) {
+			// Keep the provider usable offline: stale/empty roster beats a failed registration.
+			console.error(`[aihub] model fetch failed: ${(e as Error).message}`);
+			return [];
+		}
+	}
+
+	const config: Record<string, unknown> = {
+		baseUrl: `${base}/v1`,
+		apiKey: isPi ? "$AIHUB_API_KEY" : "AIHUB_API_KEY", // fallback; stored /login credential wins
+		authHeader: true,
+		api: "openai-completions",
+		// omp: plain API-key shaping for the anthropic-messages rows (new-api gateway, not OAuth upstream),
+		// and its anthropic route rejects the strict-tools field.
+		...(isPi ? {} : { auth: "apiKey", disableStrictTools: true }),
+		oauth: {
+			name: PROVIDER_NAME,
+			async login(callbacks: { onPrompt: (prompt: { message: string; placeholder?: string }) => Promise<string> }): Promise<unknown> {
+				const key = await callbacks.onPrompt({ message: `API key dari ${base} (sk-…)`, placeholder: "sk-…" });
+				const trimmed = key?.trim();
+				if (!trimmed) throw new Error("API key kosong");
+				// pi requires OAuthCredentials ({refresh, access, expires}); omp accepts the object too.
+				return { refresh: "", access: trimmed, expires: Number.MAX_SAFE_INTEGER };
+			},
+			// omp: apiKey stays the fallback because oauth is present; key never expires → no refreshToken.
+			getApiKey(credentials: { access?: string }): string {
+				return credentials.access ?? "";
+			},
+		},
+	};
+	if (!isPi) config.usage = makeUsageProvider(base); // omp-only surface
+	if (isPi) {
+		config.refreshModels = async (context: { credential?: unknown }) => {
+			const cred = context?.credential as { key?: unknown; access?: unknown } | undefined;
+			const key = typeof cred?.key === "string" ? cred.key : typeof cred?.access === "string" ? cred.access : process.env.AIHUB_API_KEY;
+			return fetchModels(key);
+		};
+	} else {
+		config.fetchDynamicModels = (apiKey: string | undefined) => fetchModels(apiKey);
+	}
+
+	host.registerProvider(PROVIDER_ID, config);
+
+	host.registerCommand("aihub-refresh", {
+		description: "Refresh metra models/pricing/context from the gateway now",
+		handler: async (_args, ctx) => {
+			const reg = registryOf(ctx);
+			try {
+				if (typeof reg?.refresh === "function") {
+					await reg.refresh("online");
+					notify(ctx, "aihub: model metra di-refresh (harga + konteks terbaru)", "info");
+				} else if (typeof reg?.refreshAll === "function") {
+					await reg.refreshAll();
+					notify(ctx, "aihub: model metra di-refresh", "info");
+				} else {
+					notify(ctx, "aihub: registry tidak mendukung refresh — restart sesi untuk refresh", "warning");
+				}
+			} catch (e) {
+				notify(ctx, `aihub refresh gagal: ${(e as Error).message}`, "error");
+			}
+		},
+	});
+
+	host.registerCommand("aihub-usage", {
+		description: "metranet AI hub: saldo akun, kuota key, pemakaian per model",
+		handler: async (_args, ctx) => {
+			const key = await resolveApiKey(ctx);
+			if (!key) {
+				notify(ctx, "aihub: /login metra atau set AIHUB_API_KEY dulu", "warning");
+				return;
+			}
+			try {
+				const [sub, use, tok, logs] = await Promise.all([
+					fetchJson<BillingSub>(`${base}/v1/dashboard/billing/subscription`, key),
+					fetchJson<{ total_usage?: number }>(`${base}/v1/dashboard/billing/usage`, key),
+					fetchJson<{ data?: TokenUsage }>(`${base}/api/usage/token/`, key),
+					fetchJson<{ data?: LogRow[] }>(`${base}/api/log/token`, key),
+				]);
+				const total = sub.hard_limit_usd ?? 0;
+				const usedAcc = (use.total_usage ?? 0) / 100;
+				const t = tok.data ?? {};
+				const rows = (logs.data ?? []).filter((r) => r.type === 2);
+				/** model → jendela-log aggregate (dynamic keys). */
+				const byModel = new Map<string, { req: number; inTok: number; outTok: number; quota: number }>();
+				for (const r of rows) {
+					const name = r.model_name ?? "?";
+					const b = byModel.get(name) ?? { req: 0, inTok: 0, outTok: 0, quota: 0 };
+					b.req++;
+					b.inTok += r.prompt_tokens ?? 0;
+					b.outTok += r.completion_tokens ?? 0;
+					b.quota += r.quota ?? 0;
+					byModel.set(name, b);
+				}
+				const windowCost = rows.reduce((s, r) => s + (r.quota ?? 0), 0) / QUOTA_PER_UNIT;
+				const lines = [
+					`Kredit akun: $${(total - usedAcc).toFixed(2)} sisa / $${total.toFixed(2)}`,
+					t.unlimited_quota
+						? `Key ${t.name ?? ""}: tanpa batas kuota, terpakai $${((t.total_used ?? 0) / QUOTA_PER_UNIT).toFixed(2)}`
+						: `Key ${t.name ?? ""}: $${((t.total_available ?? 0) / QUOTA_PER_UNIT).toFixed(2)} sisa / $${((t.total_granted ?? 0) / QUOTA_PER_UNIT).toFixed(2)}`,
+					`Jendela ${rows.length} request terakhir: $${windowCost.toFixed(4)} —`,
+					...[...byModel.entries()]
+						.sort((a, b) => b[1].quota - a[1].quota)
+						.slice(0, 15)
+						.map(
+							([name, b]) =>
+								`  ${name}: ${b.req} req, ${b.inTok.toLocaleString()} in / ${b.outTok.toLocaleString()} out, $${(b.quota / QUOTA_PER_UNIT).toFixed(4)}`,
+						),
+				];
+				notify(ctx, lines.join("\n"), "info");
+			} catch (e) {
+				notify(ctx, `aihub usage gagal: ${(e as Error).message}`, "error");
+			}
+		},
+	});
+}
