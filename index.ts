@@ -612,7 +612,20 @@ function notify(ctx: unknown, message: string, level: "info" | "warning" | "erro
 interface RegistryWithRefresh {
 	refresh?: (strategy?: unknown, options?: unknown) => Promise<unknown>;
 	refreshAll?: () => Promise<unknown>;
-	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	/** omp: takes a Model, not a provider id. */
+	getApiKey?: (model: unknown) => Promise<string | undefined> | string | undefined;
+}
+
+/** Session model rows of this provider (ctx.models is omp-only; absent elsewhere). */
+function providerSessionModels(ctx: unknown): { provider: unknown; id: unknown; contextWindow: unknown }[] {
+	const modelsList = (ctx as { models?: unknown } | null)?.models;
+	if (!modelsList || typeof modelsList !== "object" || !("list" in modelsList)) return [];
+	const listed = (modelsList as { list: () => unknown }).list();
+	if (!Array.isArray(listed)) return [];
+	return listed.filter(
+		(m): m is { provider: unknown; id: unknown; contextWindow: unknown } =>
+			!!m && typeof m === "object" && "provider" in m && "id" in m && "contextWindow" in m,
+	);
 }
 
 function registryOf(ctx: unknown): RegistryWithRefresh | undefined {
@@ -622,9 +635,11 @@ function registryOf(ctx: unknown): RegistryWithRefresh | undefined {
 
 async function resolveApiKey(ctx: unknown): Promise<string | undefined> {
 	const reg = registryOf(ctx);
+	const model = providerSessionModels(ctx).find((m) => m.provider === PROVIDER_ID);
 	try {
-		if (typeof reg?.getApiKey === "function") {
-			const k = await reg.getApiKey(PROVIDER_ID);
+		// omp resolves the stored /login credential (or configured key) per model row.
+		if (model && typeof reg?.getApiKey === "function") {
+			const k = await reg.getApiKey(model);
 			if (typeof k === "string" && k) return k;
 		}
 	} catch {
@@ -736,22 +751,9 @@ export default function aihubExtension(pi: object) {
 					if (row.context_length) catalogCtx.set(row.model_name, row.context_length);
 				}
 				const refs = bundledReference();
-				/** Session model rows narrowed via guard (ctx.models may be absent in print mode). */
-				const sessionModels: { id: string; contextWindow: number }[] = [];
-				const modelsList = (ctx as { models?: unknown } | null)?.models;
-				if (modelsList && typeof modelsList === "object" && "list" in modelsList) {
-					const listed = (modelsList as { list: () => unknown }).list();
-					if (Array.isArray(listed)) {
-						for (const m of listed) {
-							if (m && typeof m === "object" && "id" in m && "contextWindow" in m && "provider" in m) {
-								const row = m as { provider: unknown; id: unknown; contextWindow: unknown };
-								if (row.provider === PROVIDER_ID && typeof row.id === "string" && typeof row.contextWindow === "number") {
-									sessionModels.push({ id: row.id, contextWindow: row.contextWindow });
-								}
-							}
-						}
-					}
-				}
+				const sessionModels = providerSessionModels(ctx)
+					.filter((m) => m.provider === PROVIDER_ID && typeof m.id === "string" && typeof m.contextWindow === "number")
+					.map((m) => ({ id: m.id as string, contextWindow: m.contextWindow as number }));
 				const targetIds = all
 					? sessionModels.map((m) => ({ id: m.id, claimed: m.contextWindow }))
 					: argv.map((id) => {
