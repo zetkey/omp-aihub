@@ -61,8 +61,11 @@ omp plugin link /path/to/omp-aihub
 
 Either works:
 
-- `/login` → pick **metranet AI hub (aihub)** and paste your `sk-…` key (stored credential wins), or
-- `export AIHUB_API_KEY=sk-…` (env fallback)
+- `/login` → pick **metranet AI hub (aihub)** and paste your `sk-…` key (stored credential, recommended), or
+- `export AIHUB_API_KEY=sk-…` before starting omp (read once at plugin load).
+
+The env var is only forwarded when it is actually set — never register an env-var *name* as a
+key, or omp sends it literally (`Bearer AIHUB_API_KEY` → 401 invalid token).
 
 `AIHUB_BASE_URL` overrides the gateway URL (other new-api deployments work unchanged).
 

@@ -671,9 +671,12 @@ export default function aihubExtension(pi: object) {
 		}
 	}
 
+	const envKey = process.env.AIHUB_API_KEY;
 	const config: Record<string, unknown> = {
 		baseUrl: `${base}/v1`,
-		apiKey: isPi ? "$AIHUB_API_KEY" : "AIHUB_API_KEY", // fallback; stored /login credential wins
+		// Only pass a real key: a bare env-var NAME becomes the literal bearer token
+		// ("Bearer AIHUB_API_KEY" → 401 invalid token) and shadows the /login credential.
+		...(envKey ? { apiKey: envKey } : {}),
 		authHeader: true,
 		api: "openai-completions",
 		// omp: plain API-key shaping for the anthropic-messages rows (new-api gateway, not OAuth upstream),

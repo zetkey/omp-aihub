@@ -1,6 +1,6 @@
 {
 	"name": "omp-aihub",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "metranet AI hub (aihub.metranet.co.id, new-api) provider for omp and pi: real pricing, context windows, usage reporting, and auto-refresh",
 	"type": "module",
 	"main": "index.ts",
