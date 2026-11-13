@@ -51,7 +51,7 @@ inconclusive (never recorded).
 
 ```sh
 # from a git URL
-omp plugin install github:YOU/omp-aihub
+omp plugin install github:zetkey/omp-aihub
 
 # or link a local checkout
 omp plugin link /path/to/omp-aihub
